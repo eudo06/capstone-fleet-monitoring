@@ -1,0 +1,37 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Spark checkpoints and temporary files
+checkpoints/
+spark-warehouse/
+metastore_db/
+.derby/
+*.crc
+
+# Generated datasets
+data/
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
