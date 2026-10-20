@@ -1,6 +1,6 @@
 import json
+import time
 from confluent_kafka import Consumer, TopicPartition
-from pyspark.sql import Row
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
 from pyspark.sql.functions import when, lit
@@ -10,7 +10,8 @@ from pyspark.sql.types import (
     StructField,
     StringType,
     DoubleType,
-    BooleanType
+    BooleanType,
+    IntegerType
 )
 from pyspark.sql.functions import struct, to_json
 from pyspark.sql.functions import broadcast, coalesce
@@ -29,81 +30,102 @@ spark = (
 
 spark.sparkContext.setLogLevel("WARN")
 
-def load_fleet_catalog():
+CATALOG_TOPIC = "fleet_catalog"
+
+catalog_schema = StructType([
+    StructField("vehicle_id", StringType(), False),
+    StructField("plate", StringType(), True),
+    StructField("vehicle_type", StringType(), True),
+    StructField("home_region", StringType(), True),
+    StructField("max_payload_kg", IntegerType(), True),
+])
+
+
+def load_fleet_catalog(timeout_s=60):
+    """Read the compacted topic from the beginning up to the end offsets observed at
+    start-up and keep the latest value per key (a tombstone deletes the key).
+    This is a snapshot: later catalog changes are not seen until the job restarts."""
     consumer = Consumer({
         "bootstrap.servers": "localhost:9092",
-        "group.id": "fleet-catalog-loader",
-        "enable.auto.commit": False
+        "group.id": "fleet-catalog-loader",  # required by the client; nothing is committed
+        "enable.auto.commit": False,
     })
 
     vehicles = {}
 
     try:
-        metadata = consumer.list_topics("fleet_catalog", timeout=10)
+        metadata = consumer.list_topics(CATALOG_TOPIC, timeout=10)
+        topic_meta = metadata.topics.get(CATALOG_TOPIC)
+        if topic_meta is None or topic_meta.error is not None:
+            raise RuntimeError(f"topic {CATALOG_TOPIC} not found: run scripts/create_topics.py")
 
-        partitions = [
-            TopicPartition("fleet_catalog", partition_id)
-            for partition_id in metadata.topics["fleet_catalog"].partitions
-        ]
+        # End offset of each partition at start-up = what we must read.
+        end_offsets = {}
+        assignment = []
+        for partition_id in topic_meta.partitions:
+            low, high = consumer.get_watermark_offsets(
+                TopicPartition(CATALOG_TOPIC, partition_id), timeout=10
+            )
+            if high > low:  # an empty partition is already "finished"
+                end_offsets[partition_id] = high
+                assignment.append(TopicPartition(CATALOG_TOPIC, partition_id, low))
 
-        offsets = {}
+        consumer.assign(assignment)
+        pending = set(end_offsets)
+        deadline = time.monotonic() + timeout_s
 
-        for tp in partitions:
-            low, high = consumer.get_watermark_offsets(tp, timeout=10)
-            offsets[tp.partition] = high
+        while pending:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"catalog not fully read after {timeout_s}s, "
+                                   f"partitions still pending: {sorted(pending)}")
 
-        consumer.assign([
-            TopicPartition("fleet_catalog", tp.partition, 0)
-            for tp in partitions
-        ])
-
-        finished = set()
-
-        while len(finished) < len(partitions):
             message = consumer.poll(1.0)
-
             if message is None:
+                # Compaction can leave gaps in the offsets, so offset high-1 may never
+                # arrive: compare the consumer position with the end offset instead.
+                for tp in consumer.position(
+                        [TopicPartition(CATALOG_TOPIC, p) for p in pending]):
+                    if tp.offset >= end_offsets[tp.partition]:
+                        pending.discard(tp.partition)
                 continue
-
             if message.error():
                 raise RuntimeError(message.error())
 
             partition = message.partition()
-
-            if message.offset() >= offsets[partition]:
-                finished.add(partition)
-                continue
-
-            vehicle_id = message.key().decode("utf-8")
-
-            if message.value() is None:
-                vehicles.pop(vehicle_id, None)
-            else:
-                vehicles[vehicle_id] = json.loads(
-                    message.value().decode("utf-8")
-                )
-
-            if message.offset() >= offsets[partition] - 1:
-                finished.add(partition)
-
-        return list(vehicles.values())
-
+            if message.offset() < end_offsets[partition]:
+                key = message.key()
+                if key is None:
+                    print(f"catalog: record without key at {partition}@{message.offset()}, ignored")
+                elif message.value() is None:
+                    vehicles.pop(key.decode("utf-8"), None)  # tombstone
+                else:
+                    vehicles[key.decode("utf-8")] = message.value()
+            if message.offset() >= end_offsets[partition] - 1:
+                pending.discard(partition)
     finally:
         consumer.close()
 
+    # Validate each record explicitly (instead of filtering on the shape of vehicle_id).
+    catalog = []
+    for vehicle_id, raw in vehicles.items():
+        try:
+            record = json.loads(raw)
+            if record["vehicle_id"] != vehicle_id:
+                raise ValueError("key differs from vehicle_id")
+            catalog.append((
+                record["vehicle_id"],
+                record["plate"],
+                record["vehicle_type"],
+                record["home_region"],
+                int(record["max_payload_kg"]),
+            ))
+        except (ValueError, KeyError, TypeError) as exc:
+            print(f"catalog: invalid record for key {vehicle_id!r} ignored ({exc!r})")
+    return catalog
 
-catalog_data = load_fleet_catalog()
 
-catalog_data = [
-    vehicle
-    for vehicle in catalog_data
-    if vehicle["vehicle_id"].startswith("V")
-    and len(vehicle["vehicle_id"]) == 5
-]
-
-catalog_df = spark.createDataFrame(
-    [Row(**vehicle) for vehicle in catalog_data]
-)
+# Explicit schema: also works when the catalog is empty (schema inference would fail).
+catalog_df = spark.createDataFrame(load_fleet_catalog(), schema=catalog_schema)
 
 print("Nombre de véhicules dans le catalogue :", catalog_df.count())
 
