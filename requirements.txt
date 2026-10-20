@@ -1,4 +1,4 @@
-pyspark==3.5.1
+pyspark==3.5.8
 confluent-kafka==2.5.0
 pandas==2.2.2
 pyarrow==16.1.0
